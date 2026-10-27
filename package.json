@@ -1,0 +1,32 @@
+{
+  "name": "@framework/socialite",
+  "version": "0.2.0",
+  "description": "OAuth2 social authentication providers (GitHub, Google, Discord, and custom OIDC).",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "homepage": "https://github.com/mohamedhabibwork/framework-socialite#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mohamedhabibwork/framework.git",
+    "directory": "packages/socialite"
+  },
+  "bugs": {
+    "url": "https://github.com/mohamedhabibwork/framework/issues"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@framework/auth": "workspace:*",
+    "@framework/cache": "workspace:*",
+    "@framework/core": "workspace:*",
+    "@framework/http": "workspace:*",
+    "hono": "4.13.13",
+    "jose": "6",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@framework/testing": "workspace:*"
+  }
+}
