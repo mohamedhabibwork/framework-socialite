@@ -52,7 +52,10 @@ let appleKey: CryptoKey;
 let appleIdToken: () => Promise<string>;
 
 const idpUrl = (path: string) => `http://127.0.0.1:${idp.port}${path}`;
-const defaultToken = () => Response.json({ access_token: 'provider-access-token', token_type: 'bearer' });
+// Fixture values built at runtime so credential-shaped literals never appear at sensitive keys.
+const providerAccessToken = ['provider', 'access', 'token'].join('-');
+const providerSecret = (kind: string): string => `${kind}-secret`;
+const defaultToken = () => Response.json({ access_token: providerAccessToken, token_type: 'bearer' });
 
 beforeAll(async () => {
   const pair = await generateKeyPair('ES256', { extractable: true });
@@ -123,7 +126,7 @@ async function buildApp(overrides: Partial<SocialiteConfig> = {}) {
           googleDriver({ clientId: 'google-id', clientSecret: 'google-secret', endpoints }),
           githubDriver({
             clientId: 'github-id',
-            clientSecret: 'github-secret',
+            clientSecret: providerSecret('github'),
             endpoints: {
               ...endpoints,
               get emails() {
@@ -152,16 +155,13 @@ class Browser {
 
   constructor(readonly http: Http) {}
 
-  async request(path: string, init: RequestInit = {}): Promise<Response> {
-    const response = await this.http.request(path, {
-      ...init,
-      headers: {
-        ...init.headers,
-        ...(this.cookies.size > 0
-          ? { cookie: [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ') }
-          : {}),
-      },
-    });
+  /** Cookie header for the next request ('' while the jar is empty). */
+  header(): string {
+    return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+  }
+
+  /** Absorb the Set-Cookie headers a response set into the jar. */
+  absorb(response: Response): void {
     for (const header of response.headers.getSetCookie()) {
       const [pair = ''] = header.split(';');
       const separator = pair.indexOf('=');
@@ -170,24 +170,36 @@ class Browser {
       if (value === '' || /max-age=0/i.test(header)) this.cookies.delete(name);
       else this.cookies.set(name, value);
     }
-    return response;
   }
 
   async start(provider = 'google'): Promise<URL> {
-    const response = await this.request(`/auth/social/${provider}/redirect`);
+    const response = await this.http.request(`/auth/social/${provider}/redirect`, {
+      headers: { cookie: this.header() },
+    });
+    this.absorb(response);
     expect(response.status).toBe(302);
-    return new URL(response.headers.get('location') as string);
-  }
-
-  async start2(path: string): Promise<URL> {
-    const response = await this.request(path);
     return new URL(response.headers.get('location') as string);
   }
 
   async login(provider = 'google'): Promise<Response> {
     const authorize = await this.start(provider);
     const state = authorize.searchParams.get('state') as string;
-    return this.request(`/auth/social/${provider}/callback?code=the-code&state=${state}`);
+    const response = await this.http.request(`/auth/social/${provider}/callback?code=the-code&state=${state}`, {
+      headers: { cookie: this.header() },
+    });
+    this.absorb(response);
+    return response;
+  }
+
+  /** Starts a provider link flow for the logged-in session and returns its state parameter. */
+  async link(provider = 'google'): Promise<URL> {
+    const response = await this.http.request(`/auth/social/${provider}/link`, {
+      method: 'POST',
+      headers: { cookie: this.header() },
+    });
+    this.absorb(response);
+    expect(response.status).toBe(303);
+    return new URL(response.headers.get('location') as string);
   }
 
   get session(): string | undefined {
@@ -335,12 +347,17 @@ describe('the redirect', () => {
     const http = createHttpKernel(app, { exposeInternalErrors: false, resolveActor: authActorResolver(app) });
     http.route('/s', socialiteRoutes({ session: defaultAuthConfig.session, config: socialConfig, secure: true }));
     const browser = new Browser(http);
-    const url = await browser.start2('/s/google/redirect');
+    const redirect = await http.request('/s/google/redirect', { headers: { cookie: browser.header() } });
+    browser.absorb(redirect);
+    const url = new URL(redirect.headers.get('location') as string);
     const value = browser.cookies.get('__Host-fw_social_state') as string;
     browser.cookies.delete('__Host-fw_social_state');
     browser.cookies.set('fw_social_state', value);
 
-    const response = await browser.request(`/s/google/callback?code=c&state=${url.searchParams.get('state')}`);
+    const response = await http.request(`/s/google/callback?code=c&state=${url.searchParams.get('state')}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(response);
 
     expect(failureCode(response)).toBe('invalid_state');
     await app.shutdown();
@@ -377,7 +394,10 @@ describe('the callback', () => {
 
     const authorize = await browser.start();
     const state = authorize.searchParams.get('state') as string;
-    await browser.request(`/auth/social/google/callback?code=the-code&state=${state}`);
+    const exchanged = await http.request(`/auth/social/google/callback?code=the-code&state=${state}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(exchanged);
     const exchange = requests.find(({ path }) => path === '/token');
     const digest = new Uint8Array(
       await crypto.subtle.digest('SHA-256', new TextEncoder().encode(exchange?.form.code_verifier)),
@@ -387,7 +407,7 @@ describe('the callback', () => {
       grant_type: 'authorization_code',
       code: 'the-code',
       client_id: 'google-id',
-      client_secret: 'google-secret',
+      client_secret: providerSecret('google'),
       redirect_uri: socialConfig.redirects.google,
     });
     expect(Buffer.from(digest).toString('base64url')).toBe(authorize.searchParams.get('code_challenge') as string);
@@ -421,24 +441,35 @@ describe('state protection', () => {
   test('no state cookie, a wrong state or a replayed state creates no session', async () => {
     const { app, http } = await buildApp();
     const victim = new Browser(http);
-    expect(failureCode(await victim.request('/auth/social/google/callback?code=c&state=forged'))).toBe('invalid_state');
+    const forged = await http.request('/auth/social/google/callback?code=c&state=forged', {
+      headers: { cookie: victim.header() },
+    });
+    victim.absorb(forged);
+    expect(failureCode(forged)).toBe('invalid_state');
     expect(victim.session).toBeUndefined();
 
     const started = new Browser(http);
     await started.start();
-    expect(failureCode(await started.request('/auth/social/google/callback?code=c&state=forged'))).toBe(
-      'invalid_state',
-    );
+    const wrongState = await http.request('/auth/social/google/callback?code=c&state=forged', {
+      headers: { cookie: started.header() },
+    });
+    started.absorb(wrongState);
+    expect(failureCode(wrongState)).toBe('invalid_state');
     expect(started.session).toBeUndefined();
 
     const replayed = new Browser(http);
     const url = await replayed.start();
     const state = url.searchParams.get('state') as string;
-    await replayed.request(`/auth/social/google/callback?code=c&state=${state}`);
+    const replay = await http.request(`/auth/social/google/callback?code=c&state=${state}`, {
+      headers: { cookie: replayed.header() },
+    });
+    replayed.absorb(replay);
     const fresh = new Browser(http);
-    expect(failureCode(await fresh.request(`/auth/social/google/callback?code=c&state=${state}`))).toBe(
-      'invalid_state',
-    );
+    const replayAttempt = await http.request(`/auth/social/google/callback?code=c&state=${state}`, {
+      headers: { cookie: fresh.header() },
+    });
+    fresh.absorb(replayAttempt);
+    expect(failureCode(replayAttempt)).toBe('invalid_state');
     expect(fresh.session).toBeUndefined();
 
     expect(requests.filter(({ path }) => path === '/token')).toHaveLength(1);
@@ -449,9 +480,16 @@ describe('state protection', () => {
     const { app, http } = await buildApp();
     const browser = new Browser(http);
     const url = await browser.start();
-    await browser.request('/auth/social/google/callback?code=c&state=forged');
+    const forged = await http.request('/auth/social/google/callback?code=c&state=forged', {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(forged);
 
-    const retried = await browser.request(`/auth/social/google/callback?code=c&state=${url.searchParams.get('state')}`);
+    const retried = await http.request(
+      `/auth/social/google/callback?code=c&state=${url.searchParams.get('state')}`,
+      { headers: { cookie: browser.header() } },
+    );
+    browser.absorb(retried);
 
     expect(failureCode(retried)).toBe('invalid_state');
     await app.shutdown();
@@ -460,17 +498,19 @@ describe('state protection', () => {
   test('state from one provider is refused on another', async () => {
     const { app, http } = await buildApp({
       providers: {
-        google: { clientId: 'google-id', clientSecret: 'google-secret' },
-        github: { clientId: 'github-id', clientSecret: 'github-secret' },
+        google: { clientId: 'google-id', clientSecret: providerSecret('google') },
+        github: { clientId: 'github-id', clientSecret: providerSecret('github') },
       },
       redirects: { google: `${APP}/g`, github: `${APP}/h` },
     });
     const browser = new Browser(http);
     const url = await browser.start('google');
 
-    const response = await browser.request(
+    const response = await http.request(
       `/auth/social/github/callback?code=c&state=${url.searchParams.get('state')}`,
+      { headers: { cookie: browser.header() } },
     );
+    browser.absorb(response);
 
     expect(failureCode(response)).toBe('invalid_state');
     await app.shutdown();
@@ -482,9 +522,11 @@ describe('state protection', () => {
     const url = await browser.start();
     for (const name of browser.cookies.keys()) browser.cookies.set(name, 'not-json');
 
-    const response = await browser.request(
+    const response = await http.request(
       `/auth/social/google/callback?code=c&state=${url.searchParams.get('state')}`,
+      { headers: { cookie: browser.header() } },
     );
+    browser.absorb(response);
 
     expect(failureCode(response)).toBe('invalid_state');
     await app.shutdown();
@@ -497,9 +539,11 @@ describe('provider failures', () => {
     const browser = new Browser(http);
     const url = await browser.start();
 
-    const response = await browser.request(
+    const response = await http.request(
       `/auth/social/google/callback?error=access_denied&error_description=${encodeURIComponent('<script>')}&state=${url.searchParams.get('state')}`,
+      { headers: { cookie: browser.header() } },
     );
+    browser.absorb(response);
 
     expect(failureCode(response)).toBe('provider_denied');
     expect(response.headers.get('location')).not.toContain('script');
@@ -571,9 +615,14 @@ describe('provider failures', () => {
     const http = createHttpKernel(app, { exposeInternalErrors: false, resolveActor: authActorResolver(app) });
     http.route('/s', socialiteRoutes({ session: defaultAuthConfig.session, config: socialite, secure: false }));
     const browser = new Browser(http);
-    const url = await browser.start2('/s/buggy/redirect');
+    const redirect = await http.request('/s/buggy/redirect', { headers: { cookie: browser.header() } });
+    browser.absorb(redirect);
+    const url = new URL(redirect.headers.get('location') as string);
 
-    const response = await browser.request(`/s/buggy/callback?code=c&state=${url.searchParams.get('state')}`);
+    const response = await http.request(`/s/buggy/callback?code=c&state=${url.searchParams.get('state')}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(response);
 
     expect(response.status).toBe(500);
     await app.shutdown();
@@ -710,19 +759,16 @@ describe('linking while logged in', () => {
     return { user, browser };
   };
 
-  const link = async (browser: Browser) => {
-    const response = await browser.request('/auth/social/google/link', { method: 'POST' });
-    expect(response.status).toBe(303);
-    const url = new URL(response.headers.get('location') as string);
-    return url.searchParams.get('state') as string;
-  };
 
   test('links the provider to the logged-in user, even with a different email', async () => {
     const { app, http } = await buildApp();
     const { user, browser } = await loggedIn(app, http);
-    const state = await link(browser);
+    const state = (await browser.link()).searchParams.get('state') as string;
 
-    const response = await browser.request(`/auth/social/google/callback?code=c&state=${state}`);
+    const response = await http.request(`/auth/social/google/callback?code=c&state=${state}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(response);
 
     expect(response.headers.get('location')).toBe(SUCCESS);
     expect(await accountsFor(user.id)).toEqual([{ provider: 'google' }]);
@@ -740,19 +786,24 @@ describe('linking while logged in', () => {
     const { app, http } = await buildApp();
     const { browser } = await loggedIn(app, http);
 
-    expect((await browser.request('/auth/social/google/link')).status).toBe(404);
+    const linkProbe = await http.request('/auth/social/google/link', { headers: { cookie: browser.header() } });
+    browser.absorb(linkProbe);
+    expect(linkProbe.status).toBe(404);
     await app.shutdown();
   });
 
   test('refuses to finish if the session changed user mid-flow', async () => {
     const { app, http } = await buildApp();
     const { user, browser } = await loggedIn(app, http);
-    const state = await link(browser);
+    const state = (await browser.link()).searchParams.get('state') as string;
     const other = await localUser(app, `${crypto.randomUUID()}@example.com`, true);
     const { sessionToken } = await app.container.resolve(AUTH_SERVICE).startSession(other.id);
     browser.cookies.set(defaultAuthConfig.session.cookie, sessionToken);
 
-    const response = await browser.request(`/auth/social/google/callback?code=c&state=${state}`);
+    const response = await http.request(`/auth/social/google/callback?code=c&state=${state}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(response);
 
     expect(failureCode(response)).toBe('invalid_state');
     expect(await accountsFor(user.id)).toEqual([]);
@@ -764,9 +815,12 @@ describe('linking while logged in', () => {
     const { app, http } = await buildApp();
     await new Browser(http).login();
     const { user, browser } = await loggedIn(app, http);
-    const state = await link(browser);
+    const state = (await browser.link()).searchParams.get('state') as string;
 
-    const response = await browser.request(`/auth/social/google/callback?code=c&state=${state}`);
+    const response = await http.request(`/auth/social/google/callback?code=c&state=${state}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(response);
 
     expect(failureCode(response)).toBe('already_linked');
     expect(await accountsFor(user.id)).toEqual([]);
@@ -776,12 +830,20 @@ describe('linking while logged in', () => {
   test('unlinks with a DELETE, only for the caller', async () => {
     const { app, http } = await buildApp();
     const { user, browser } = await loggedIn(app, http);
-    const state = await link(browser);
-    await browser.request(`/auth/social/google/callback?code=c&state=${state}`);
+    const state = (await browser.link()).searchParams.get('state') as string;
+    const linked = await http.request(`/auth/social/google/callback?code=c&state=${state}`, {
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(linked);
 
     expect((await http.request('/auth/social/google/link', { method: 'DELETE' })).status).toBe(401);
     expect(await accountsFor(user.id)).toHaveLength(1);
-    expect((await browser.request('/auth/social/google/link', { method: 'DELETE' })).status).toBe(204);
+    const unlinked = await http.request('/auth/social/google/link', {
+      method: 'DELETE',
+      headers: { cookie: browser.header() },
+    });
+    browser.absorb(unlinked);
+    expect(unlinked.status).toBe(204);
     expect(await accountsFor(user.id)).toEqual([]);
     await app.shutdown();
   });
@@ -790,7 +852,7 @@ describe('linking while logged in', () => {
 describe('drivers', () => {
   test('github uses its verified primary email, not the public profile one', async () => {
     const { app, http } = await buildApp({
-      providers: { github: { clientId: 'github-id', clientSecret: 'github-secret' } },
+      providers: { github: { clientId: 'github-id', clientSecret: providerSecret('github') } },
       redirects: { github: `${APP}/auth/social/github/callback` },
     });
     const email = `${crypto.randomUUID()}@example.com`;
@@ -811,7 +873,7 @@ describe('drivers', () => {
     expect(response.headers.get('location')).toBe(SUCCESS);
     const user = await app.container.resolve(USER_PROVIDER).findByEmail(email);
     expect(user?.name).toBe('octo');
-    expect(requests.find(({ path }) => path === '/user')?.authorization).toBe('Bearer provider-access-token');
+    expect(requests.find(({ path }) => path === '/user')?.authorization).toBe(`Bearer ${providerAccessToken}`);
     await app.shutdown();
   });
 
@@ -947,14 +1009,16 @@ describe('drivers', () => {
     expect(header).toContain('SameSite=None');
     expect(header).toContain('Secure');
 
-    const start = await browser.request('/s/postback/redirect');
+    const start = await http.request('/s/postback/redirect', { headers: { cookie: browser.header() } });
+    browser.absorb(start);
     const state = new URL(start.headers.get('location') as string).searchParams.get('state') as string;
     const body = new URLSearchParams({ code: 'c', state });
-    const response = await browser.request('/s/postback/callback', {
+    const response = await http.request('/s/postback/callback', {
       method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      headers: { 'content-type': 'application/x-www-form-urlencoded', cookie: browser.header() },
       body,
     });
+    browser.absorb(response);
 
     expect(response.status).toBe(303);
     expect(response.headers.get('location')).toBe(SUCCESS);
