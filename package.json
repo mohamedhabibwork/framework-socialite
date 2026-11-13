@@ -32,7 +32,7 @@
     "@framework/database": "workspace:*",
     "@framework/http": "workspace:*",
     "drizzle-orm": "0.45.4",
-    "hono": "4.13.13",
+    "hono": "4.13.16",
     "jose": "6",
     "zod": "4.6.7"
   },
